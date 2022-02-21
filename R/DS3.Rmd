@@ -1,0 +1,227 @@
+---
+title: "Rを用いた因果効果算出方法の確認"
+author: "Kazuhisa Ishihara"
+date: "2022年2月12日"
+output: html_document
+---
+
+```{r set_library, include = FALSE}
+library(tidyverse)
+library(magrittr)
+library(WeightIt)
+library(cobalt)
+library(pROC)
+```
+
+## 目的
+岩波データサイエンス Vol.3を買ったので「CM接触の因果効果と調整効果」におけるデータおよび結果をテキストにRを用いた因果効果推定方法を学習する。
+正解というか、お手本は著者（加藤 諒＆星野 崇宏）により  
+https://github.com/iwanami-datascience/vol3/tree/master/kato%26hoshino  
+にRコードとデータが公開されている。また、  
+https://tjo.hatenablog.com/entry/2016/08/29/190000#fn-aebe1af1  
+などでも解説されている。
+
+## データの読み込みと説明
+マーケットリサーチのための有償のパネルボランティアより得た情報に基づくデータ。
+ゲームに対するCM効果を推定するために供給されたものらしい。
+有償パネルで1万レコードって・・・と思ったら疑似データと書いてあった。  
+カテゴリ変数はすべてダミー変数化されている。  
+CMへの接触の有無、ゲームプレイの有無・回数・秒数、TVの視聴秒数といった行動履歴から、年齢・性別などのデモグラフィック、家族構成・居住地・所得・学歴などソシオグラフィックがデータ化されていると書かれている。
+学歴、出てきてないけど  
+・・・こういうのソシオグラフィック(sociographics)っていうのね。確かに人のメタ情報としてはdemographicsとはちょっと違うか。  
+ぶっちゃけ、あまりきちんと変数について説明がされておらず、ちょっとこの事例を使うことを後悔している。  
+・・・が、練習としてはどうでもいいか。
+
+```{r read_data}
+#データの読み込み　公開データをRで直接読み込む。
+data1 <- read.csv("https://github.com/iwanami-datascience/vol3/raw/master/kato%26hoshino/q_data_x.csv")
+names(data1)
+```
+
+cm_dummy;CMを見たか否か 1が見た場合  
+gamedummy;ゲームアプリの利用者か否か おそらく1が実施  
+area    ;居住エリア おそらくいずれも居住地の場合1  
+  _kanto   
+  _keihan  
+  _tokai  
+  _keihanshin  
+age     ;被験者年齢 連続値  
+sex     ;性別 男性1 女性0  
+marry_dummy     ;婚姻状況 おそらく1が既婚  
+job_dummy1 - job_dummy8     ;被験者の職業 8種あるけど、なにかわからん!  
+inc     ;年収 連続値 0は扶養家族かな～ ホントはhouse incomeにしないとダメなような。  
+pmoney  ;月当たりのお小遣いらしい 連続値  
+fam_str_dummy1 - fam_str_dummy5 ;家族構成 なにかわからん!  
+child_dummy     ;子供の有無 おそらく1が有り  
+
+以下は広告業界でよく使われる分類だそうな  
+T       ;T層 13-19歳の男女  
+F1      ;20-34歳の女性  
+F2      ;35-49歳の女性  
+F3      ;50歳以上の女性  
+M1      ;20-34歳の男性  
+M2      ;35-49歳の男性  
+M3      ;50歳以上の男性  
+
+TVwatch_day     ;1日あたりの平均テレビ視聴時間  
+gamesecond      ;ゲーム実施時間  
+gamecount       ;ゲーム実施回数  
+
+## ロジスティクス回帰によるPSスコアの算出
+お手本をなぞって変数を投入 選択理由は気にしない
+```{r calc_ps}
+#formulaの作成
+covname <- names(data1)
+psfm <- paste(covname[c(33, 7:9, 25, 18:19, 3, 5:6, 10:16, 20:23)],
+                collapse = "+") %>%
+        paste("cm_dummy ~ ", .) %>%
+        formula()
+psfm
+#PSスコアの算出
+fm1 <- glm(psfm, data = data1, family = binomial(link = "logit"))
+summary(fm1)
+data1$PScore <- fm1$fitted.values
+
+#ROC曲線を書いておく 古い人間なので、plotが一番楽なのさ
+ROC1 <- roc(cm_dummy ~ PScore, data = data1, ci = TRUE)
+ROC1
+plot (ROC1, main = "Receiver Operating Characteristic(ROC)Curve")
+```
+
+c統計量は0.791とお手本通りの結果。ROC曲線もきれいだな。
+
+# IPWの確認
+```{r check_balance}
+#ここではRパッケージのweightitで重みを計算してみる
+IPW_weight <- weightit(
+        psfm,
+        data = data1,
+        method = "ps",
+        ps = data1$PScore,
+        estimand = "ATE",
+        stabilize = FALSE
+        )
+
+#データセットに対するweightの付加
+data1 <- mutate(data1, IPW = IPW_weight$weights)
+
+#PSスコアのバランス確認　これもRパッケージのcobaltで実施
+bal.plot(IPW_weight, var.name = "prop.score", which = "both",
+          type = "histogram", mirror = TRUE,
+          sample.names = c("Before", "After"))
+
+#共変量のバランス確認
+set.cobalt.options(binary = "std") #標準化平均差を出すためにオプション設定
+love.plot(IPW_weight, thresholds = .1, stars = "std", abs = T)
+```
+
+書籍化されている事例のわりにバランスが取れてない気もする。テレビを見た日数は調整されきれてないし、東海地方在住者なんか調整前と逆転してしまっている。結構ロジスティクス回帰の係数大きいけどな。
+まあ、これも練習用だからいいのか。
+
+## 因果効果の推定
+計算方法はいくつかあるみたいなので、併用で実施してみる
+
+### 計算方法1 お手本の方法
+お手本では説明変数にそれぞれ介入群、非介入群からみた該当、非該当のフラグを入れ、
+切片項を除外し、重みをIPWとした線形回帰により算出している。
+```{r method1}
+#割り当て変数zの定義
+ivec1 <- data1$cm_dummy #介入群（CMを見た群）を示すベクトル
+ivec0 <- ifelse(ivec1 == 1,0,1) #非介入群（CMを見ていない群）を示すベクトル
+ivec <- cbind(ivec1,ivec0)
+
+#IPW計算
+iestp1 <- (ivec1/data1$PScore) #介入群（CMを見た群）に対する重み
+iestp0 <- (ivec0/(1-data1$PScore)) #非介入群（CMを見ていない群）に対する重み
+iestp <- iestp1+iestp0 #投入する重み（それぞれ、該当しない群は0だから単に足せばOK
+
+#因果効果の推定
+#ゲームを実施したか否か　カテゴリデータだよね リスク差、リスク比、オッズ比を算出しておく
+fm2 <- lm(data1$gamedummy ~ ivec + 0, weights=iestp)
+summary(fm2)
+ipwe2_1 <- fm2[[1]][1]
+ipwe2_0 <- fm2[[1]][2]
+
+#リスク比
+ipwe2_1 / ipwe2_0
+
+#オッズ比
+(ipwe2_1 / (1 - ipwe2_1)) / (ipwe2_0 / (1 - ipwe2_0))
+
+#お手本の回帰式の書き方はRっぽくていいのかもしれないけど好みからすると下記の書き方の方が好き
+fm2_2 <- lm(data1$gamedummy ~ ivec0 + ivec1 - 1, weights = iestp)
+summary(fm2_2)
+ipwe22_0 <- fm2_2[[1]][1]
+ipwe22_1 <- fm2_2[[1]][2]
+
+#ゲーム実施回数　これは数値変数　リスク差を出しておく　
+fm3 <- lm(data1$gamecount ~ ivec + 0, weights = iestp)
+summary(fm3)
+ipwe3_1 <- fm3[[1]][1]
+ipwe3_0 <- fm3[[1]][2]
+
+#リスク差
+ipwe3_1 - ipwe3_0
+
+#ゲーム実行時間　これも数値変数
+fm4 <- lm(data1$gamesecond ~ ivec + 0, weights = iestp)
+summary(fm4)
+ipwe4_1 <- fm4[[1]][1]
+ipwe4_0 <- fm4[[1]][2]
+#リスク差
+ipwe4_1 - ipwe4_0
+```
+カテゴリデータも数値データも同じやり方だから楽でいいし、値そのものが算出できるのでよいけど、
+医学領域でよく使われるオッズ比やリスク比や、リスク差にすると信頼区間の推定にひと手間が必要となる。
+とりあえず、お手本でも点推定だけなので、今は点推定のみ。書籍にはSEも出ているから後で追加
+
+### 計算方法2 回帰で算出してみる
+```{r method2}
+# ゲームを実施したか否か
+#fm5 = glm(data1$gamedummy ~ data1$cm_dummy, family = binomial(link = "logit"), weights = iestp)
+fm5 = glm(data1$gamedummy ~ data1$cm_dummy, family = quasibinomial(link = "logit"), weights = iestp)
+summary(fm5)
+
+#オッズ比
+exp(fm5[[1]][2])
+
+#ゲーム実施回数
+fm6 = lm(data1$gamecount ~ data1$cm_dummy, weights=iestp)
+summary(fm6)
+
+#ゲーム実行時間
+fm7 = lm(data1$gamesecond ~ data1$cm_dummy, weights=iestp)
+summary(fm7)
+
+```
+ゲーム実施の有無はカテゴリカルデータなのでロジスティック回帰でオッズ比を係数として出すことにしてみたところ警告が・・・
+weightにIPWを入れると整数じゃなくなるからっぽい。  
+familyをquasibinomialに変更してみた。  
+
+ゲーム実施回数と実行時間は数値データなのでそのまま回帰で実施。  
+カテゴリカルデータは対数オッズ比が直接求まり、SEもそのまま算出される。
+ただ、quasibinomialではAICは算出されなくなる。  
+医学領域過去の論文との比較なんかでオッズ比にこだわるのであればこの方が楽かもしれない。  
+
+数値データは差分が効果として出てきて、切片に非介入群が入っている。
+差分にのみ興味があるならやっぱりこの方法がよいかな。
+
+### 計算方法3 ベタに計算
+```{r method3}
+calc_ce <- name <- function(y, z1, ps) {
+#y;目的変数、z1;処置のフラグ、ps;プロペンシティスコア
+        ipwe1 <- sum((z1 * y) / ps) / sum(z1 / ps)
+        ipwe0 <- sum(((1 - z1) * y) / (1 - ps)) / sum((1 - z1) / (1 - ps))
+        return (list(ipwe1 = ipwe1, ipwe0 = ipwe0))
+}
+
+# ゲームを実施したか否か
+calc_ce(y = data1$gamedummy, z1 = data1$cm_dummy, ps = data1$PScore)
+
+#ゲーム実施回数
+calc_ce(y = data1$gamecount, z1 = data1$cm_dummy, ps = data1$PScore)
+
+#ゲーム実行時間
+calc_ce(y = data1$gamesecond, z1 = data1$cm_dummy, ps = data1$PScore)
+```
+簡単な関数を作ってしまえばいいだけだけど、まあ、あまり使うこともないかな。導出した式の意味を考えるにはいいかもしれない。
